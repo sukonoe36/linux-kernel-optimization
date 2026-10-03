@@ -39,6 +39,21 @@ docs/
 - `root` (or `CAP_BPF` + `CAP_PERFMON`) to load and attach BPF programs.
 - For benchmarks: `iperf3`, `fio`, `perf` (linux-tools), `sysstat` (optional).
 
+## Observability
+
+Two CO-RE tracers are provided. Both use kprobes rather than tracepoints: the
+tracepoint context types (`trace_event_raw_*`) are not part of BTF and so are
+absent from `vmlinux.h`.
+
+- `tcp_retrans` attaches to `tcp_retransmit_skb` and counts retransmissions per
+  destination address.
+- `biolatency` attaches to `blk_account_io_start`/`blk_account_io_done` and
+  builds a log2 histogram of block I/O latency in microseconds.
+
+If a kprobe cannot be attached on your kernel (the function may be absent or
+inlined), the loader reports the error from libbpf; run it as root and check
+`/proc/kallsyms` for the symbol.
+
 ## Quick start
 
 Build a tracer:

@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /* biolatency.bpf.c - Block I/O latency histogram (CO-RE).
  *
- * Traces block I/O issue and completion, computing per-request latency and
- * recording it into log2-bucketed histograms, one per CPU (aggregated in
- * userspace). Works across devices; the device major:minor can optionally be
- * filtered from userspace via the filter map.
+ * Traces the start and completion of block requests, computes the per-request
+ * latency and records it in log2-bucketed histograms, one per CPU (aggregated
+ * in userspace). All devices are traced unless a single major:minor is
+ * installed in the filter map from userspace.
  *
- * Build with: make (uses bpftool gen to produce vmlinux.h if absent).
+ * kprobes on blk_account_io_start/blk_account_io_done are used instead of the
+ * block/block_rq_issue and block/block_rq_complete tracepoints because the
+ * tracepoints' generated context types (trace_event_raw_*) are not part of BTF
+ * and therefore absent from vmlinux.h. The kprobe arguments are plain
+ * `struct request *` pointers, which CO-RE relocates safely.
+ *
+ * Build with: make (generates vmlinux.h with bpftool when it is missing).
  */
 #include <vmlinux.h>
 #include <bpf/bpf_core_read.h>
@@ -17,15 +23,15 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 #define MAX_BUCKETS 32 /* log2 microseconds: 0..2^31 us */
 
-/* In-flight request tracking, keyed by request pointer. */
+/* In-flight requests, keyed by (u64)struct request *. Value: start time in ns. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 16384);
-	__type(key, __u64); /* (u64)struct request * */
-	__type(value, __u64); /* start timestamp (ns) */
+	__type(key, __u64);
+	__type(value, __u64);
 } starts SEC(".maps");
 
-/* Per-CPU latency histograms, bucket = log2(latency_us). */
+/* Per-CPU latency histograms; bucket index = floor(log2(latency_us)). */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, MAX_BUCKETS);
@@ -33,43 +39,55 @@ struct {
 	__type(value, __u64);
 } lat_hist SEC(".maps");
 
-/* Optional device filter: if a key exists, only that major:minor is traced. */
+/* Optional device filter. Slot 0 is the "filter installed" marker; a key of
+ * (major << 16) | first_minor selects the single device to trace. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1);
-	__type(key, __u32); /* (major << 8) | minor is not used; dev_t encoded */
+	__uint(max_entries, 1024);
+	__type(key, __u32);
 	__type(value, __u8);
 } filter_map SEC(".maps");
 
-/* Number of requests issued/completed, for sanity checks in userspace. */
+/* Counters for sanity checks in userspace: [0]=started [1]=completed. */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 2); /* [0]=issued [1]=completed */
+	__uint(max_entries, 2);
 	__type(key, __u32);
 	__type(value, __u64);
 } counts SEC(".maps");
 
-static __always_inline __u32 dev_key(struct request *rq)
+/* filter_active reports whether userspace installed a device filter. */
+static __always_inline int filter_active(void)
 {
-	struct gendisk *disk = BPF_CORE_READ(rq, q, disk);
-	__u32 major = BPF_CORE_READ(disk, major);
-	__u16 first_minor = BPF_CORE_READ(disk, first_minor);
+	__u32 slot = 0;
 
-	return (major << 16) | first_minor;
+	return bpf_map_lookup_elem(&filter_map, &slot) != NULL;
 }
 
+/* device_key encodes major:minor the same way userspace does. */
+static __always_inline __u32 device_key(struct request *rq)
+{
+	struct gendisk *disk = BPF_CORE_READ(rq, q, disk);
+	__u32 major, minor;
+
+	if (!disk)
+		return 0;
+
+	major = BPF_CORE_READ(disk, major);
+	minor = BPF_CORE_READ(disk, first_minor);
+	return (major << 16) | (minor & 0xffff);
+}
+
+/* allowed returns 1 when the request should be traced. */
 static __always_inline int allowed(struct request *rq)
 {
 	__u32 key;
-	__u32 slot = 0;
-	__u8 *v;
 
-	if (bpf_map_lookup_elem(&filter_map, &slot) == NULL)
-		return 1; /* no filter installed -> trace everything */
+	if (!filter_active())
+		return 1;
 
-	key = dev_key(rq);
-	v = bpf_map_lookup_elem(&filter_map, &key);
-	return v != NULL;
+	key = device_key(rq);
+	return bpf_map_lookup_elem(&filter_map, &key) != NULL;
 }
 
 static __always_inline void count_inc(__u32 slot)
@@ -80,44 +98,47 @@ static __always_inline void count_inc(__u32 slot)
 		__sync_fetch_and_add(c, 1);
 }
 
-SEC("tracepoint/block/block_rq_issue")
-int trace_block_rq_issue(struct trace_event_raw_block_rq_issue *ctx)
+SEC("kprobe/blk_account_io_start")
+int BPF_KPROBE(trace_io_start, struct request *rq)
 {
-	__u64 ts = bpf_ktime_get_ns();
-	__u64 *p;
-	__u64 req = (__u64)ctx->rq;
+	__u64 key, ts, *p;
 
-	if (!allowed((struct request *)(unsigned long)req))
+	if (!rq || !allowed(rq))
 		return 0;
 
-	p = bpf_map_lookup_elem(&starts, &req);
+	ts = bpf_ktime_get_ns();
+	key = (__u64)rq;
+
+	p = bpf_map_lookup_elem(&starts, &key);
 	if (p)
 		*p = ts;
 	else
-		bpf_map_update_elem(&starts, &req, &ts, BPF_ANY);
+		bpf_map_update_elem(&starts, &key, &ts, BPF_ANY);
 
 	count_inc(0);
 	return 0;
 }
 
-SEC("tracepoint/block/block_rq_complete")
-int trace_block_rq_complete(struct trace_event_raw_block_rq_complete *ctx)
+SEC("kprobe/blk_account_io_done")
+int BPF_KPROBE(trace_io_done, struct request *rq)
 {
-	__u64 req = (__u64)ctx->rq;
-	__u64 *start, lat_ns, lat_us;
+	__u64 key, *start, lat_ns, lat_us, *h;
 	__u32 bucket, slot = 1;
-	__u64 *h;
 
-	start = bpf_map_lookup_elem(&starts, &req);
+	if (!rq)
+		return 0;
+
+	key = (__u64)rq;
+	start = bpf_map_lookup_elem(&starts, &key);
 	if (!start)
 		return 0;
 
 	lat_ns = bpf_ktime_get_ns() - *start;
-	bpf_map_delete_elem(&starts, &req);
-	lat_us = lat_ns / 1000;
+	bpf_map_delete_elem(&starts, &key);
 
-	/* Bucket by integer log2 of microseconds. */
-	bucket = lat_us ? (63 - __builtin_clzll(lat_us)) : 0;
+	lat_us = lat_ns / 1000;
+	/* Bucket by integer log2 of the microsecond latency. */
+	bucket = lat_us ? (__u32)(63 - __builtin_clzll(lat_us)) : 0;
 	if (bucket >= MAX_BUCKETS)
 		bucket = MAX_BUCKETS - 1;
 
@@ -128,5 +149,3 @@ int trace_block_rq_complete(struct trace_event_raw_block_rq_complete *ctx)
 	count_inc(slot);
 	return 0;
 }
-
-char _license[] SEC("license") = "GPL";

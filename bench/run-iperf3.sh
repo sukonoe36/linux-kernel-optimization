@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-# shellcheck source=common.sh
+# shellcheck source=bench/common.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 SERVER=""

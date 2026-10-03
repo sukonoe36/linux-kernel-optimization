@@ -20,7 +20,12 @@ help:
 	@echo "  clean  - remove generated objects and binaries"
 
 # Generate vmlinux.h from the running kernel if it is missing.
+# bpftool is required; on distributions without a standalone bpftool package it
+# comes from the kernel's linux-tools package.
 vmlinux.h:
+	@command -v $(BPFTOOL) >/dev/null 2>&1 || { \
+		echo "error: $(BPFTOOL) not found; install it (e.g. linux-tools-generic) or" >&2; \
+		echo "       provide a vmlinux.h in this directory" >&2; exit 1; }
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format header > $@
 
 tcp_retrans.bpf.o: tcp_retrans.bpf.c vmlinux.h

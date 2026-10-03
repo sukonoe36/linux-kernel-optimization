@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /* tcp_retrans.bpf.c - Trace TCP retransmissions per destination address.
  *
- * CO-RE (Compile Once - Run Everywhere) BPF program attached to the
- * tcp_retransmit_skb kernel tracepoint. Counts retransmits keyed by the
- * remote (destination) address of the socket, so userspace can report which
- * peers are suffering packet loss.
+ * CO-RE (Compile Once - Run Everywhere) BPF program attached to a kprobe on
+ * tcp_retransmit_skb. Counts retransmits keyed by the remote (destination)
+ * address of the socket, so userspace can report which peers are suffering
+ * packet loss.
  *
- * Build with: make (uses bpftool to produce vmlinux.h if absent).
+ * A kprobe is used instead of the tcp/tcp_retransmit_skb tracepoint because the
+ * tracepoint's generated context type (trace_event_raw_tcp_retransmit_skb) is
+ * not part of BTF and therefore absent from vmlinux.h, while the kprobe argument
+ * is a plain `struct sock *` that CO-RE can relocate safely across kernels.
+ *
+ * Build with: make (generates vmlinux.h with bpftool when it is missing).
  */
 #include <vmlinux.h>
 #include <bpf/bpf_core_read.h>
@@ -15,7 +20,14 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
-/* Key: remote address (IPv4-mapped value or full IPv6). Value: retransmit count. */
+#ifndef AF_INET
+#define AF_INET 2
+#endif
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
+
+/* Key: remote address (IPv4 value or full IPv6). Value: retransmit count. */
 struct dest_key {
 	__u32 family; /* AF_INET or AF_INET6 */
 	__u32 pad;
@@ -40,10 +52,9 @@ struct {
 	__type(value, __u64);
 } totals_map SEC(".maps");
 
-SEC("tracepoint/tcp/tcp_retransmit_skb")
-int trace_tcp_retransmit_skb(struct trace_event_raw_tcp_retransmit_skb *ctx)
+SEC("kprobe/tcp_retransmit_skb")
+int BPF_KPROBE(trace_tcp_retransmit_skb, struct sock *sk)
 {
-	struct sock *sk = BPF_CORE_READ(ctx, sk);
 	struct dest_key key = {};
 	__u64 *val, init = 1, *cnt;
 	__u32 slot = 0;
@@ -65,11 +76,10 @@ int trace_tcp_retransmit_skb(struct trace_event_raw_tcp_retransmit_skb *ctx)
 	}
 
 	val = bpf_map_lookup_elem(&retrans_map, &key);
-	if (val) {
+	if (val)
 		__sync_fetch_and_add(val, 1);
-	} else {
+	else
 		bpf_map_update_elem(&retrans_map, &key, &init, BPF_NOEXIST);
-	}
 
 	cnt = bpf_map_lookup_elem(&totals_map, &slot);
 	if (cnt)
