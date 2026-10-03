@@ -1,0 +1,52 @@
+# tuning.service - Apply a sysctl tuning profile at boot.
+#
+# Install (example):
+#   sudo install -m 0644 systemd/tuning.service /etc/systemd/system/tuning.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tuning.service
+#
+# The unit runs tuning/apply-profile.sh against the selected profile. Adjust
+# ExecStart's --profile path to switch between network-latency and
+# high-throughput. apply-profile.sh is idempotent: it re-records the current
+# values as a backup on each boot before applying.
+#
+# To pick a profile without editing this file, override the environment via a
+# drop-in:
+#   sudo systemctl edit tuning.service
+#   [Service]
+#   Environment=TUNING_PROFILE=/opt/linux-kernel-optimization/tuning/high-throughput.conf
+
+[Unit]
+Description=Apply sysctl kernel tuning profile
+Documentation=file:///usr/share/doc/linux-kernel-optimization/docs/METHODOLOGY.md
+DefaultDependencies=no
+After=sysinit.target local-fs.target
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+ConditionPathExists=/proc/sys
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Path to the checkout. Override with a drop-in (see header) for other locations.
+Environment=TUNING_PROFILE=/opt/linux-kernel-optimization/tuning/network-latency.conf
+Environment=TUNING_SCRIPT=/opt/linux-kernel-optimization/tuning/apply-profile.sh
+
+# Fail the unit if the profile cannot be applied; the kernel keeps its previous
+# values, which is the safe outcome.
+ExecStart=/usr/bin/env bash -c 'exec "${TUNING_SCRIPT}" --profile "${TUNING_PROFILE}"'
+
+# The script must run as root to write to /proc/sys.
+User=root
+Group=root
+
+# Modest hardening: the unit only needs to write sysctls and read the profile.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/proc/sys /var/backups/sysctl-profiles
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

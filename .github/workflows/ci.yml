@@ -1,0 +1,74 @@
+# CI for linux-kernel-optimization.
+#
+# Two jobs:
+#   1. shellcheck - lint every Bash script in the repository.
+#   2. ebpf-compile - build the CO-RE BPF objects with clang to catch type and
+#      CO-RE errors early. Loading/attaching is intentionally NOT attempted:
+#      it requires privileges and a matching kernel, which CI does not provide.
+name: ci
+
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Lint all shell scripts
+        run: |
+          set -euo pipefail
+          mapfile -t scripts < <(git ls-files '*.sh')
+          if [ "${#scripts[@]}" -eq 0 ]; then
+            echo "No shell scripts found." >&2
+            exit 1
+          fi
+          printf 'Linting %d script(s)\n' "${#scripts[@]}"
+          shellcheck --version
+          shellcheck --severity=style --external-sources "${scripts[@]}"
+
+  ebpf-compile:
+    name: eBPF compile check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            llvm \
+            libelf-dev \
+            libbpf-dev \
+            bpftool \
+            build-essential
+
+      - name: Show toolchain versions
+        run: |
+          clang --version
+          bpftool version || true
+
+      - name: Compile tcp_retrans BPF object
+        working-directory: ebpf/tcp_retrans
+        run: make check
+
+      - name: Compile biolatency BPF object
+        working-directory: ebpf/biolatency
+        run: make check
