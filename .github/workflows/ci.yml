@@ -1,0 +1,96 @@
+# CI for linux-kernel-optimization.
+#
+# Two jobs:
+#   1. shellcheck - lint every Bash script in the repository.
+#   2. ebpf-compile - build the CO-RE BPF objects with clang to catch type and
+#      CO-RE errors early. Loading/attaching is intentionally NOT attempted:
+#      it requires privileges and a matching kernel, which CI does not provide.
+name: ci
+
+on:
+  push:
+    branches: [main, 'feat/**', 'fix/**']
+  pull_request:
+    branches: [main, 'feat/**', 'fix/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Lint all shell scripts
+        run: |
+          set -euo pipefail
+          mapfile -t scripts < <(git ls-files '*.sh')
+          if [ "${#scripts[@]}" -eq 0 ]; then
+            echo "No shell scripts found." >&2
+            exit 1
+          fi
+          printf 'Linting %d script(s)\n' "${#scripts[@]}"
+          shellcheck --version
+          # severity=warning: advisory style/info notes (for example SC1091 for
+          # dynamically computed source paths) must not fail the build, but real
+          # warnings and errors do.
+          shellcheck --severity=warning --external-sources "${scripts[@]}"
+
+  ebpf-compile:
+    name: eBPF compile check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev libbpf-dev build-essential
+
+          # Ubuntu ships no standalone 'bpftool' package. The binary comes from
+          # the per-kernel linux-tools packages, and the 'linux-tools-common'
+          # wrapper only works when the tools package matching the running kernel
+          # is installed - which is often not the case on hosted runners. Try the
+          # plausible sources, then locate the real binary and put it on PATH.
+          for pkg in \
+              "linux-tools-$(uname -r)" \
+              linux-tools-azure \
+              linux-tools-generic \
+              linux-tools-common; do
+            sudo apt-get install -y --no-install-recommends "${pkg}" \
+              || echo "note: ${pkg} is not installable on this runner"
+          done
+
+          if ! bpftool version >/dev/null 2>&1; then
+            real="$(find /usr/lib/linux-tools -type f -name bpftool 2>/dev/null | head -n1 || true)"
+            if [ -n "${real}" ]; then
+              echo "using ${real} as bpftool"
+              sudo ln -sf "${real}" /usr/local/bin/bpftool
+            fi
+          fi
+
+          command -v bpftool
+          bpftool version
+
+      - name: Show toolchain versions
+        run: |
+          clang --version
+
+      - name: Compile tcp_retrans BPF object
+        working-directory: ebpf/tcp_retrans
+        run: make check
+
+      - name: Compile biolatency BPF object
+        working-directory: ebpf/biolatency
+        run: make check
